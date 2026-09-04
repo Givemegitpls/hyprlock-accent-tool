@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target
+
+# makepkg (Arch packaging) — запускать НЕ в корне проекта
+/pkg/
+.SRCINFO
+
+# Node (opencode tooling)
+node_modules/
+
+# Misc
+.DS_Store
