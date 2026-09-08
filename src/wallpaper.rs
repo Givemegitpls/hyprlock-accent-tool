@@ -1,18 +1,31 @@
 //! Wallpaper acquisition via `awww query`.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Return the current awww wallpaper path.
+/// One output's wallpaper as reported by awww.
+#[derive(Debug, Clone)]
+pub struct MonitorWallpaper {
+    /// Output port name (e.g. `HDMI-A-1`), `None` when it could not be parsed.
+    pub output: Option<String>,
+    pub path: PathBuf,
+}
+
+/// Return the current awww wallpaper per output.
 ///
-/// `HYPRLOCK_WALLPAPER` overrides the query (testing / fixed wallpapers).
-pub fn get_wallpaper() -> Result<PathBuf, String> {
+/// `HYPRLOCK_WALLPAPER` overrides the query (testing / fixed wallpapers) and
+/// yields a single unnamed entry.
+pub fn get_wallpapers() -> Result<Vec<MonitorWallpaper>, String> {
     if let Some(forced) = std::env::var_os("HYPRLOCK_WALLPAPER") {
-        let p = std::path::Path::new(&forced);
+        let p = Path::new(&forced);
         if !p.is_file() {
             return Err(format!("wallpaper does not exist: {}", p.display()));
         }
-        return Ok(p.to_path_buf());
+        return Ok(vec![MonitorWallpaper {
+            output: None,
+            path: p.to_path_buf(),
+        }]);
     }
 
     let out = Command::new("awww")
@@ -26,36 +39,50 @@ pub fn get_wallpaper() -> Result<PathBuf, String> {
         return Err(format!("awww query failed: {}", stderr.trim()));
     }
 
-    let paths: Vec<&str> = stdout
-        .lines()
-        .filter_map(|line| line.split("image:").nth(1))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    // multi-monitor: awww reports one image per output; dedupe, and warn when
-    // outputs disagree (we cannot know which output hosts the clock column).
-    let mut unique = paths.clone();
-    unique.sort_unstable();
-    unique.dedup();
-    let path = match unique.as_slice() {
-        [] => return Err(format!("could not parse wallpaper from:\n{stdout}")),
-        [only] => (*only).to_string(),
-        [first, ..] => {
-            eprintln!(
-                "warning: multiple wallpapers active ({} outputs); using {first}",
-                paths.len()
-            );
-            (*first).to_string()
+    // Line format: `: HDMI-A-1: 1920x1080, scale: 1, currently displaying: image: /path`
+    let mut result = Vec::new();
+    for line in stdout.lines() {
+        let Some((head, path)) = line.split_once("currently displaying: image:") else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
         }
-    };
-
-    let path = expand_tilde(&path);
-    let p = std::path::Path::new(&path);
-    if !p.is_file() {
-        return Err(format!("wallpaper does not exist: {path}"));
+        let output = head
+            .split(':')
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .map(str::to_string);
+        result.push(MonitorWallpaper {
+            output,
+            path: PathBuf::from(path),
+        });
     }
-    Ok(p.to_path_buf())
+
+    if result.is_empty() {
+        return Err(format!("could not parse wallpaper from:\n{stdout}"));
+    }
+
+    for m in &mut result {
+        let expanded = expand_tilde(&m.path.to_string_lossy());
+        let p = Path::new(&expanded);
+        if !p.is_file() {
+            return Err(format!("wallpaper does not exist: {expanded}"));
+        }
+        m.path = p.to_path_buf();
+    }
+    Ok(result)
+}
+
+/// First occurrence of every distinct wallpaper path, order preserved.
+pub fn unique_by_path(wallpapers: &[MonitorWallpaper]) -> Vec<MonitorWallpaper> {
+    let mut seen = HashSet::new();
+    wallpapers
+        .iter()
+        .filter(|m| seen.insert(m.path.clone()))
+        .cloned()
+        .collect()
 }
 
 fn expand_tilde(path: &str) -> String {

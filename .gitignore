@@ -4,6 +4,9 @@
 # makepkg (Arch packaging) — запускать НЕ в корне проекта
 /pkg/
 .SRCINFO
+/hyprlock-accent/
+/src/hyprlock-accent/
+*.pkg.tar.zst
 
 # Node (opencode tooling)
 node_modules/

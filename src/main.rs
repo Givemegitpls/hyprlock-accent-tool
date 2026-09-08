@@ -3,6 +3,7 @@
 
 mod analysis;
 mod cache;
+mod config;
 mod wallpaper;
 
 use cache::CachedEntry;
@@ -12,6 +13,7 @@ const ALPHA: &str = "FF"; // 255 = 1
 
 struct Args {
     no_launch: bool,
+    print_config: bool,
     max_width: u32,
     column_frac: f64,
     set_offset: Option<i32>,
@@ -24,6 +26,7 @@ fn print_help() {
          \n\
          options:\n\
          \x20 --no-launch            print computed values and exit\n\
+         \x20 --print-config         print the rendered per-monitor config and exit\n\
          \x20 --max-width <px>       downscale width for analysis (default: 800)\n\
          \x20 --column-frac <f>      clock column width as width fraction, 0..1 (default: 0.28)\n\
          \x20 --set-offset <pct>     pin y_offset percentage for the wallpaper and exit\n\
@@ -55,6 +58,7 @@ fn opt_value(
 fn parse_args() -> Args {
     let mut args = std::env::args().skip(1).peekable();
     let mut no_launch = false;
+    let mut print_config = false;
     let mut max_width = 800u32;
     let mut column_frac = 0.28f64;
     let mut set_offset: Option<i32> = None;
@@ -73,6 +77,7 @@ fn parse_args() -> Args {
                 std::process::exit(0);
             }
             "--no-launch" => no_launch = true,
+            "--print-config" => print_config = true,
             a if a == "--max-width" || a.starts_with("--max-width=") => {
                 match opt_value("--max-width", a, &mut args)
                     .and_then(|s| s.parse::<u32>().ok())
@@ -110,6 +115,7 @@ fn parse_args() -> Args {
 
     Args {
         no_launch,
+        print_config,
         max_width,
         column_frac,
         set_offset,
@@ -117,29 +123,27 @@ fn parse_args() -> Args {
     }
 }
 
-/// Env-provided color override (`RRGGBB` or `RRGGBBAA`, no leading `#`), else
-/// the computed default. 6-digit values gain the default `FF` alpha.
-fn override_color(var_name: &str, default: &str) -> String {
-    let Some(raw) = std::env::var(var_name).ok() else {
-        return default.to_string();
-    };
-    if raw.is_empty() {
-        return default.to_string();
-    }
+/// Validated `HYPRLOCK_*` color override (`RRGGBB` or `RRGGBBAA`, no `#`),
+/// else `None`. 6-digit values gain the default `FF` alpha.
+fn env_override(var_name: &str) -> Option<String> {
+    let raw = std::env::var(var_name).ok()?;
     let value = raw.trim().trim_start_matches('#');
     let is_hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
     if value.len() == 6 && is_hex(value) {
-        format!("{}{}", value.to_uppercase(), ALPHA)
+        Some(format!("{}{ALPHA}", value.to_uppercase()))
     } else if value.len() == 8 && is_hex(value) {
-        value.to_uppercase()
+        Some(value.to_uppercase())
     } else {
         eprintln!("warning: {var_name}={raw:?} not RRGGBB[AA]; ignoring");
-        default.to_string()
+        None
     }
 }
 
-fn run_hyprlock(env: &[(String, String)], extra_args: &[String]) -> ! {
+fn run_hyprlock(config: Option<&str>, env: &[(String, String)], extra_args: &[String]) -> ! {
     let mut cmd = Command::new("hyprlock");
+    if let Some(c) = config {
+        cmd.arg("-c").arg(c);
+    }
     cmd.args(extra_args);
     for (k, v) in env {
         cmd.env(k, v);
@@ -183,58 +187,178 @@ fn compute_and_store(
     Ok((accent, foreground, offset))
 }
 
+/// Per-wallpaper resolved values, colors already include alpha.
+struct Resolved {
+    wallpaper: wallpaper::MonitorWallpaper,
+    accent: String,
+    foreground: String,
+    y_offset: i32,
+}
+
 fn main() {
     let args = parse_args();
 
-    let wallpaper = match wallpaper::get_wallpaper() {
-        Ok(w) => w.to_string_lossy().into_owned(),
+    let wallpapers = match wallpaper::get_wallpapers() {
+        Ok(w) => w,
         Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(1);
         }
     };
+    let unique = wallpaper::unique_by_path(&wallpapers);
 
-    // --set-offset N: persist and exit (no launch, no compute)
+    // --set-offset N: persist and exit (no launch, no compute). Needs an
+    // unambiguous target wallpaper.
     if let Some(value) = args.set_offset {
-        cache::pin_offset(&wallpaper, value);
-        println!("pinned y_offset={value}% for {wallpaper}");
+        if unique.len() > 1 {
+            let names = unique
+                .iter()
+                .map(|m| {
+                    m.output
+                        .clone()
+                        .unwrap_or_else(|| m.path.to_string_lossy().into_owned())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("error: multiple wallpapers active ({names}); set HYPRLOCK_WALLPAPER to pin one");
+            std::process::exit(1);
+        }
+        let path = unique[0].path.to_string_lossy().into_owned();
+        cache::pin_offset(&path, value);
+        println!("pinned y_offset={value}% for {path}");
         return;
     }
+
+    let accent_override = env_override("HYPRLOCK_ACCENT");
+    let foreground_override = env_override("HYPRLOCK_FOREGROUND");
 
     // cached full result (per wallpaper) or fresh compute. Hits require the
     // same analysis parameters the entry was computed with; pin-only or legacy
     // entries count as misses and the pinned y_offset is preserved by
     // compute_and_store().
-    let (accent_base, foreground_base, y_offset) = match cache::load_cached(&wallpaper) {
-        Some(e) if e.matches_analysis(args.max_width, args.column_frac) => {
-            (e.accent, e.foreground, e.y_offset)
-        }
-        _ => match compute_and_store(&wallpaper, args.max_width, args.column_frac) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
+    let mut resolved: Vec<Resolved> = Vec::new();
+    for m in &unique {
+        let wp = m.path.to_string_lossy().into_owned();
+        let (accent_base, foreground_base, y_offset) = match cache::load_cached(&wp) {
+            Some(e) if e.matches_analysis(args.max_width, args.column_frac) => {
+                (e.accent, e.foreground, e.y_offset)
             }
-        },
-    };
+            _ => match compute_and_store(&wp, args.max_width, args.column_frac) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            },
+        };
+        resolved.push(Resolved {
+            wallpaper: m.clone(),
+            accent: accent_override
+                .clone()
+                .unwrap_or_else(|| format!("{accent_base}{ALPHA}")),
+            foreground: foreground_override
+                .clone()
+                .unwrap_or_else(|| format!("{foreground_base}{ALPHA}")),
+            y_offset,
+        });
+    }
 
-    let accent = override_color("HYPRLOCK_ACCENT", &format!("{accent_base}{ALPHA}"));
-    let foreground = override_color("HYPRLOCK_FOREGROUND", &format!("{foreground_base}{ALPHA}"));
+    if resolved.len() == 1 {
+        run_single(&args, resolved.remove(0));
+    } else {
+        run_multi(&args, resolved);
+    }
+}
 
-    if args.no_launch {
+/// One wallpaper for everything: values via env vars, stock config untouched.
+fn run_single(args: &Args, r: Resolved) {
+    let wallpaper = r.wallpaper.path.to_string_lossy().into_owned();
+    if args.print_config {
+        eprintln!("note: single-wallpaper mode feeds values via env vars, nothing to render");
+    }
+    if args.no_launch || args.print_config {
         println!("WALLPAPER={wallpaper}");
-        println!("accent={accent}");
-        println!("foreground={foreground}");
-        println!("y_offset={y_offset}%");
+        println!("accent={}", r.accent);
+        println!("foreground={}", r.foreground);
+        println!("y_offset={}%", r.y_offset);
         return;
     }
 
     let env = vec![
         ("WALLPAPER".to_string(), wallpaper.clone()),
-        ("accent".to_string(), accent),
-        ("foreground".to_string(), foreground),
-        ("y_offset".to_string(), format!("{y_offset}%")),
+        ("accent".to_string(), r.accent),
+        ("foreground".to_string(), r.foreground),
+        ("y_offset".to_string(), format!("{}%", r.y_offset)),
     ];
+    run_hyprlock(None, &env, &args.hyprlock_args);
+}
 
-    run_hyprlock(&env, &args.hyprlock_args);
+/// Distinct wallpaper per output: render the user's template once per monitor
+/// with `monitor = <output>` and literal values, launch hyprlock with it.
+fn run_multi(args: &Args, mut resolved: Vec<Resolved>) {
+    if resolved.iter().any(|r| r.wallpaper.output.is_none()) {
+        eprintln!(
+            "warning: awww output names unavailable; falling back to the first wallpaper for all monitors"
+        );
+        run_single(args, resolved.remove(0));
+        return;
+    }
+
+    let template_path = match config::template_path() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "error: cannot render per-monitor config: hypr/hyprlock.conf not found under XDG_CONFIG_HOME or ~/.config"
+            );
+            std::process::exit(1);
+        }
+    };
+    let template = match std::fs::read_to_string(&template_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {e}", template_path.display());
+            std::process::exit(1);
+        }
+    };
+
+    let values: Vec<config::RenderValues> = resolved
+        .iter()
+        .map(|r| config::RenderValues {
+            output: r.wallpaper.output.clone().unwrap_or_default(),
+            wallpaper: r.wallpaper.path.to_string_lossy().into_owned(),
+            accent: r.accent.clone(),
+            foreground: r.foreground.clone(),
+            y_offset: format!("{}%", r.y_offset),
+        })
+        .collect();
+    let rendered = config::render(&template, &values);
+
+    if args.print_config {
+        print!("{rendered}");
+        return;
+    }
+
+    if args.no_launch {
+        for r in &resolved {
+            println!(
+                "[{}] WALLPAPER={} accent={} foreground={} y_offset={}%",
+                r.wallpaper.output.clone().unwrap_or_default(),
+                r.wallpaper.path.display(),
+                r.accent,
+                r.foreground,
+                r.y_offset
+            );
+        }
+        return;
+    }
+
+    let config_path = match std::env::var("USER") {
+        Ok(u) => format!("/tmp/hyprlock-accent-{u}.conf"),
+        Err(_) => "/tmp/hyprlock-accent.conf".to_string(),
+    };
+    if let Err(e) = std::fs::write(&config_path, &rendered) {
+        eprintln!("error: cannot write {config_path}: {e}");
+        std::process::exit(1);
+    }
+    run_hyprlock(Some(&config_path), &[], &args.hyprlock_args);
 }

@@ -2,7 +2,7 @@
 
 pkgname=hyprlock-accent-git
 _pkgbase=hyprlock-accent
-pkgver=r2.a2fad97
+pkgver=r3.b0e8dc8
 pkgrel=1
 pkgdesc='Compute accent/foreground colors and clock horizontal offset for hyprlock from current awww wallpaper'
 url='https://github.com/Givemegitpls/hyprlock-accent-tool'
