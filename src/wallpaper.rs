@@ -26,14 +26,31 @@ pub fn get_wallpaper() -> Result<PathBuf, String> {
         return Err(format!("awww query failed: {}", stderr.trim()));
     }
 
-    let path = stdout
+    let paths: Vec<&str> = stdout
         .lines()
-        .find_map(|line| line.split("image:").nth(1))
-        .map(|s| s.trim())
+        .filter_map(|line| line.split("image:").nth(1))
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("could not parse wallpaper from:\n{stdout}"))?;
+        .collect();
 
-    let path = expand_tilde(path);
+    // multi-monitor: awww reports one image per output; dedupe, and warn when
+    // outputs disagree (we cannot know which output hosts the clock column).
+    let mut unique = paths.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    let path = match unique.as_slice() {
+        [] => return Err(format!("could not parse wallpaper from:\n{stdout}")),
+        [only] => (*only).to_string(),
+        [first, ..] => {
+            eprintln!(
+                "warning: multiple wallpapers active ({} outputs); using {first}",
+                paths.len()
+            );
+            (*first).to_string()
+        }
+    };
+
+    let path = expand_tilde(&path);
     let p = std::path::Path::new(&path);
     if !p.is_file() {
         return Err(format!("wallpaper does not exist: {path}"));

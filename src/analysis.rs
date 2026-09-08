@@ -18,13 +18,13 @@ pub fn load_image(path: &str, max_width: u32) -> Result<(Vec<u8>, u32, u32), Str
 
     let ratio = max_width as f64 / w as f64;
     let dst_h = (h as f64 * ratio).round() as u32;
-    let resized = resize_lanczos(&data, w, h, max_width, dst_h)?;
+    let resized = resize_lanczos(data, w, h, max_width, dst_h)?;
     Ok((resized, max_width, dst_h))
 }
 
-/// LANCZOS resize RGB8 -> RGB8.
-fn resize_lanczos(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Result<Vec<u8>, String> {
-    let src_img = fir::images::Image::from_vec_u8(sw, sh, src.to_vec(), fir::PixelType::U8x3)
+/// LANCZOS resize RGB8 -> RGB8. Consumes `src`.
+fn resize_lanczos(src: Vec<u8>, sw: u32, sh: u32, dw: u32, dh: u32) -> Result<Vec<u8>, String> {
+    let src_img = fir::images::Image::from_vec_u8(sw, sh, src, fir::PixelType::U8x3)
         .map_err(|e| format!("resize src: {e}"))?;
     let mut dst = fir::images::Image::new(dw, dh, fir::PixelType::U8x3);
     let mut resizer = fir::Resizer::new();
@@ -65,14 +65,14 @@ fn sliding_mean(v: &[f32], window: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
     // prefix sums for O(n) windowed mean
     let mut prefix = vec![0.0f32; n + 1];
-    for i in 0..n {
-        prefix[i + 1] = prefix[i] + v[i];
+    for (i, &x) in v.iter().enumerate() {
+        prefix[i + 1] = prefix[i] + x;
     }
-    for i in 0..n {
+    for (i, slot) in out.iter_mut().enumerate() {
         let lo = i.saturating_sub(offset);
         let hi = (i + k - offset).min(n);
         if lo < hi {
-            out[i] = (prefix[hi] - prefix[lo]) / denom;
+            *slot = (prefix[hi] - prefix[lo]) / denom;
         }
     }
     out
@@ -211,9 +211,10 @@ pub fn compute_y_offset(
         gaps.push((prev_end, wm));
     }
 
+    // sal.len() == w, so the fraction check reduces to a plain width compare
     let fitting: Vec<(usize, usize)> = gaps
         .into_iter()
-        .filter(|(a, b)| (b - a) as f64 / wm as f64 * w as f64 >= column_w as f64)
+        .filter(|(a, b)| b - a >= column_w)
         .collect();
 
     if let Some(&(a, b)) = fitting.iter().max_by_key(|(a, b)| b - a) {

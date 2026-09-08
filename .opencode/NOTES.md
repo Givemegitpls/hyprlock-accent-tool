@@ -3,8 +3,10 @@
 Rust-бинарь `hyprlock-accent` (`src/`, `cargo build --release`) считает accent-цвет + горизонтальный offset часов для hyprlock на основе текущих обоев awww.
 
 ## Реализация (hyprlock-accent)
-- Кэш `~/.cache/hyprlock-accent.json`: {md5_пути: {wallpaper, accent, foreground, y_offset}}.
+- Кэш `~/.cache/hyprlock-accent.json`: {md5_пути: {wallpaper, accent, foreground, y_offset, src_mtime, src_size, max_width, column_frac}}. `src_mtime`/`src_size` (serde default) — инвалидация по содержимому: смена файла по тому же пути → пересчёт (пин offset при этом теряется — by design). `max_width`/`column_frac` — кэш-хит только при тех же параметрах анализа (проверка в main, НЕ в load_cached, чтобы не терять пин). Запись кэша атомарная (tmp + rename), стэмп файла из одного stat.
+- Запись с пустыми accent/foreground (после `--set-offset` без расчёта) считается неполной: цвета пересчитываются, пин `y_offset` сохраняется.
 - Нюансы порта (важны при правках): `edge_profile` возвращает `w-1` колонок, `saliency_map` — `w`. `np.convolve(...,'same')` = центрированное окно с делением всегда на K (не trailing/normalized). `fast_image_resize` LANCZOS даёт ±1 младший бит против PIL на краевых пикселях → цвета ±1, y_offset совпадает точно.
+- Multi-output: per-monitor поддержка НЕ реализована сознательно. Разные обои на мониторах → dedupe + warning, берётся первая запись `awww query`. Per-monitor через env невозможно (переменные hyprlock глобальные), единственный путь — генерация конфига из шаблона + `hyprlock -c` (решение отложено).
 - Rust API: `fast_image_resize::images::Image` (не реэкспортирован в корне); resize → `dst.into_vec()` (нет `write_back`); `ResizeAlg::Convolution(FilterType::Lanczos3)`.
 
 ## Ключевые решения
@@ -32,8 +34,9 @@ hyprlock-accent -- -g 2       # флаги hyprlock после --
 - Пакетирование: `PKGBUILD` в репозитории (`hyprlock-accent-git`, MIT, cargo build). См. skill `pkgbuild`.
 
 ## Пакетирование (makepkg) — важно
-- `makepkg` НЕ запускать в корне проекта: он клонирует source (`SRCDEST` = текущая папка) в `./hyprlock-accent/` (bare) и распаковывает в `./src/`, замусоривая настоящий Rust-исходник `src/*.rs`. Собирать в отдельной папке: `mkdir /tmp/pk && cp PKGBUILD /tmp/pk/ && cd /tmp/pk && makepkg -si`.
-- Сбои `makepkg` при запуске из корня: `pkgver()` возвращает пустую строку (source-клон не попадает в ожидаемую папку из-за конфликта имён пакета/каталога). Правильное место сборки решает обе проблемы.
+- `makepkg` НЕ запускать в корне проекта: собирать в отдельной папке `mkdir /tmp/pk && cp PKGBUILD /tmp/pk/ && cd /tmp/pk && makepkg -si`.
+- PKGBUILD (исправлен): `build()`/`package()` делают `cd "$_pkgbase"` (git-source чекаут лежит в `$srcdir/$_pkgbase`, без cd cargo/LICENSE не находятся); `cargo fetch --locked` перед `cargo build --frozen` (frozen = offline+точный lock, fetch обновляет локальный sparse-индекс, не трогая Cargo.lock — иначе на машинах с протухшим кэшем serde-подобные версии не резолвятся); LICENSE ставится из `src/LICENSE` (лежит там намеренно).
+- `RUSTUP_TOOLCHAIN=stable` в PKGBUILD обязателен: у rustup на этой машине не задан default-тулчейн, голый `cargo` падает.
 
 ## Сетевые
 - pip/pypi недоступен напрямую; прокси socks5 в env на 127.0.0.1:1080 (данные у юзера), сборка Rust-зависимостей шла через него.

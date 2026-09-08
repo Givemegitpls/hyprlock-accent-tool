@@ -18,6 +18,40 @@ struct Args {
     hyprlock_args: Vec<String>,
 }
 
+fn print_help() {
+    println!(
+        "usage: hyprlock-accent [options] [-- hyprlock-args]\n\
+         \n\
+         options:\n\
+         \x20 --no-launch            print computed values and exit\n\
+         \x20 --max-width <px>       downscale width for analysis (default: 800)\n\
+         \x20 --column-frac <f>      clock column width as width fraction, 0..1 (default: 0.28)\n\
+         \x20 --set-offset <pct>     pin y_offset percentage for the wallpaper and exit\n\
+         \x20 -h, --help             show this help\n\
+         \n\
+         env:\n\
+         \x20 HYPRLOCK_WALLPAPER     force wallpaper path\n\
+         \x20 HYPRLOCK_ACCENT        override accent color (RRGGBB[AA])\n\
+         \x20 HYPRLOCK_FOREGROUND    override foreground color (RRGGBB[AA])\n\
+         \n\
+         arguments after -- are passed to hyprlock."
+    );
+}
+
+/// Value for `--opt <v>` / `--opt=<v>`. A following `--`-prefixed argument is
+/// never consumed as a value (reported as missing by the caller instead).
+fn opt_value(
+    flag: &str,
+    arg: &str,
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+) -> Option<String> {
+    if let Some(v) = arg.strip_prefix(&format!("{flag}=")) {
+        return Some(v.to_string());
+    }
+    let next_is_flag = args.peek().is_some_and(|v| v.starts_with("--"));
+    if next_is_flag { None } else { args.next() }
+}
+
 fn parse_args() -> Args {
     let mut args = std::env::args().skip(1).peekable();
     let mut no_launch = false;
@@ -34,20 +68,40 @@ fn parse_args() -> Args {
         }
         match arg.as_str() {
             "--" => after_dashdash = true,
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
             "--no-launch" => no_launch = true,
-            "--max-width" => {
-                if let Some(v) = args.next() {
-                    max_width = v.parse().unwrap_or(800);
+            a if a == "--max-width" || a.starts_with("--max-width=") => {
+                match opt_value("--max-width", a, &mut args)
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|&v| v > 0)
+                {
+                    Some(v) => max_width = v,
+                    None => eprintln!(
+                        "warning: --max-width needs a positive integer; using {max_width}"
+                    ),
                 }
             }
-            "--column-frac" => {
-                if let Some(v) = args.next() {
-                    column_frac = v.parse().unwrap_or(0.28);
+            a if a == "--column-frac" || a.starts_with("--column-frac=") => {
+                match opt_value("--column-frac", a, &mut args)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|&v| v > 0.0 && v <= 1.0)
+                {
+                    Some(v) => column_frac = v,
+                    None => eprintln!(
+                        "warning: --column-frac needs a number in (0, 1]; using {column_frac}"
+                    ),
                 }
             }
-            "--set-offset" => {
-                if let Some(v) = args.next() {
-                    set_offset = v.parse().ok();
+            a if a == "--set-offset" || a.starts_with("--set-offset=") => {
+                match opt_value("--set-offset", a, &mut args).and_then(|s| s.parse::<i32>().ok())
+                {
+                    Some(v) => set_offset = Some(v),
+                    None => {
+                        eprintln!("warning: --set-offset needs an integer percentage; ignoring")
+                    }
                 }
             }
             other => hyprlock_args.push(other.to_string()),
@@ -93,6 +147,10 @@ fn run_hyprlock(env: &[(String, String)], extra_args: &[String]) -> ! {
     let status = cmd.status();
     let code = match status {
         Ok(s) => s.code().unwrap_or(1),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("error: hyprlock not found in PATH");
+            127
+        }
         Err(e) => {
             eprintln!("error: failed to launch hyprlock: {e}");
             1
@@ -114,13 +172,13 @@ fn compute_and_store(
     let accent = analysis::vivid_color(&rgb, w as usize, h as usize, 0.005);
     let foreground = analysis::bright_color(&rgb, w as usize, h as usize, 0.001);
 
-    let entry = CachedEntry {
-        wallpaper: wallpaper.to_string(),
-        accent: accent.clone(),
-        foreground: foreground.clone(),
-        y_offset: offset,
-    };
-    cache::store(wallpaper, entry);
+    let entry = CachedEntry::new(
+        wallpaper.to_string(),
+        accent.clone(),
+        foreground.clone(),
+        offset,
+    );
+    cache::store(wallpaper, entry, (max_width, column_frac));
 
     Ok((accent, foreground, offset))
 }
@@ -143,10 +201,15 @@ fn main() {
         return;
     }
 
-    // cached full result (per wallpaper) or fresh compute
+    // cached full result (per wallpaper) or fresh compute. Hits require the
+    // same analysis parameters the entry was computed with; pin-only or legacy
+    // entries count as misses and the pinned y_offset is preserved by
+    // compute_and_store().
     let (accent_base, foreground_base, y_offset) = match cache::load_cached(&wallpaper) {
-        Some(e) => (e.accent, e.foreground, e.y_offset),
-        None => match compute_and_store(&wallpaper, args.max_width, args.column_frac) {
+        Some(e) if e.matches_analysis(args.max_width, args.column_frac) => {
+            (e.accent, e.foreground, e.y_offset)
+        }
+        _ => match compute_and_store(&wallpaper, args.max_width, args.column_frac) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("{e}");
