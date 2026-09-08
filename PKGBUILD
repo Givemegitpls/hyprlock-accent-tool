@@ -17,16 +17,18 @@ conflicts=("${_pkgbase}")
 
 pkgver() {
   cd "$_pkgbase"
-  ( set -o pipefail
-    git describe --long --tags --abbrev=7 2>/dev/null \
-      | sed 's/\([^-]*-g\)/r\1/;s/-/./g' \
-      || printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+  (
+    set -o pipefail
+    git describe --long --tags --abbrev=7 2>/dev/null |
+      sed 's/\([^-]*-g\)/r\1/;s/-/./g' ||
+      printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
   )
 }
 
 build() {
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
+  cargo fetch --locked
   cargo build --frozen --release
 }
 
